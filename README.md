@@ -1,4 +1,3 @@
-# ai-assistant
 # ATS Resume Checker
 
 Upload a resume (PDF, DOCX or TXT) and get an **estimated ATS score** with specific improvements, rewrite examples and keyword suggestions. Optionally paste a job description to get a keyword-match score for that role.
@@ -62,6 +61,9 @@ streamlit run app.py
 |---|---|---|
 | `GEMINI_API_KEY` | Streamlit secrets or environment variable | none (sidebar input is shown if missing) |
 | `GEMINI_MODEL` | Streamlit secrets or environment variable | `gemini-3.5-flash` |
+| `GEMINI_FALLBACK_MODELS` | Streamlit secrets or environment variable | `gemini-3.8-flash,gemini-3.1-flash-lite` |
+
+**Overload handling:** Gemini sometimes returns `503 UNAVAILABLE` ("high demand") during traffic spikes. The app automatically retries up to 3 times with increasing waits, then falls back to the models in `GEMINI_FALLBACK_MODELS`. Key/permission errors are not retried. Set the fallbacks as a comma-separated list, for example `GEMINI_FALLBACK_MODELS = "model-a,model-b"`.
 
 Google renames and retires models over time. If you see a "model not found" error, set `GEMINI_MODEL` to a current Flash model listed at <https://ai.google.dev/gemini-api/docs/models>.
 
@@ -105,6 +107,7 @@ Resume text is sent to Google's Gemini API for analysis. The app itself does not
 | Problem | Fix |
 |---|---|
 | "Gemini rejected the API key" | Re-copy the key from AI Studio; make sure there are no spaces. |
+| "Gemini is overloaded right now" (503) | Temporary on Google's side. The app already retried and tried backup models; wait a minute and click Analyze again. |
 | "Rate limit or quota reached" | Wait a minute, or check your quota in Google AI Studio. |
 | "Could not find that model name" | Set `GEMINI_MODEL` to a current model name. |
 | "Only N characters could be extracted" | The PDF is probably scanned. Export a text-based PDF/DOCX. |
