@@ -17,7 +17,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import random
 import re
+import time
 from dataclasses import asdict, dataclass
 
 import streamlit as st
@@ -27,6 +29,11 @@ import streamlit as st
 # --------------------------------------------------------------------------- #
 
 DEFAULT_MODEL = "gemini-3.5-flash"  # override with the GEMINI_MODEL secret/env var
+# Tried in order if the main model is overloaded (503) or unavailable.
+# Override with GEMINI_FALLBACK_MODELS="model-a,model-b" (secret/env var).
+DEFAULT_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite"]
+RETRIES_PER_MODEL = 3
+RETRY_BASE_DELAY = 1.5  # seconds; doubles each retry (1.5s, 3s)
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS_TO_AI = 15_000
 MAX_JD_CHARS_TO_AI = 6_000
@@ -426,6 +433,65 @@ def call_gemini(api_key: str, model: str, prompt: str) -> str:
     return text
 
 
+def _error_code(exc: Exception) -> int | None:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    m = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Temporary Google-side problems worth retrying (overload, timeouts, empty reply)."""
+    if isinstance(exc, RuntimeError):  # empty / blocked response
+        return True
+    if _error_code(exc) in (500, 502, 503, 504):
+        return True
+    low = str(exc).lower()
+    return any(
+        s in low
+        for s in ("unavailable", "overloaded", "high demand", "deadline", "timed out", "timeout", "internal error")
+    )
+
+
+def _should_try_next_model(exc: Exception) -> bool:
+    """Problems that a different model may not have (quota per model, unknown model)."""
+    low = str(exc).lower()
+    return _error_code(exc) in (404, 429) or "resource_exhausted" in low or "not found" in low
+
+
+def model_chain(primary: str) -> list[str]:
+    raw = get_setting("GEMINI_FALLBACK_MODELS")
+    fallbacks = [m.strip() for m in raw.split(",") if m.strip()] if raw else DEFAULT_FALLBACK_MODELS
+    chain: list[str] = []
+    for m in [primary, *fallbacks]:
+        if m and m not in chain:
+            chain.append(m)
+    return chain
+
+
+def generate_with_fallback(api_key: str, models: list[str], prompt: str, sleep=time.sleep) -> str:
+    """Call Gemini, retrying temporary errors with backoff and then falling back to the
+    next model in the list. Auth/bad-request errors are raised immediately."""
+    last_error: Exception | None = None
+    for model in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return call_gemini(api_key, model, prompt)
+            except Exception as exc:
+                last_error = exc
+                if _is_transient(exc):
+                    if attempt < RETRIES_PER_MODEL - 1:
+                        sleep(RETRY_BASE_DELAY * 2**attempt + random.uniform(0, 0.5))
+                        continue
+                    break  # still failing: move on to the next model
+                if _should_try_next_model(exc):
+                    break
+                raise
+    assert last_error is not None
+    raise last_error
+
+
 def parse_ai_json(text: str) -> dict:
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.I)
@@ -501,9 +567,10 @@ def normalize_ai_result(data: dict) -> dict:
 
 def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
     prompt = build_prompt(resume_text, job_description)
+    models = model_chain(model)
     last_error: Exception | None = None
     for _ in range(2):  # one retry if the model returns malformed JSON
-        raw = call_gemini(api_key, model, prompt)
+        raw = generate_with_fallback(api_key, models, prompt)
         try:
             return normalize_ai_result(parse_ai_json(raw))
         except (ValueError, json.JSONDecodeError) as exc:
@@ -530,11 +597,17 @@ def score_label(score: int) -> str:
 def friendly_api_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
-    if "api key" in low or "api_key" in low or "401" in low or "403" in low or "permission" in low:
+    code = _error_code(exc)
+    if _is_transient(exc):
+        return (
+            "Gemini is overloaded right now (a temporary problem on Google's side). "
+            "The app already retried and tried backup models. Please wait a minute and click Analyze again."
+        )
+    if "api key" in low or "api_key" in low or code in (401, 403) or "permission" in low:
         return "Gemini rejected the API key. Check that it is correct and enabled."
-    if "429" in low or "quota" in low or "resource_exhausted" in low or "rate" in low:
+    if code == 429 or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
-    if "404" in low or "not found" in low:
+    if code == 404 or "not found" in low:
         return "Gemini could not find that model name. Check the GEMINI_MODEL setting."
     return f"Something went wrong while contacting Gemini: {msg}"
 
